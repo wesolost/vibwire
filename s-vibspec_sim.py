@@ -15,12 +15,12 @@
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
-from scipy.fft import fft, ifft
+from scipy.fft import fft as npfft
+from scipy.fft import ifft as npifft
 from scipy.signal import find_peaks
 from scipy.optimize import curve_fit
 from enum import Enum, auto
-import warnings
-warnings.filterwarnings('ignore')
+from typing import Optional
 
 ### defination
 class Window(Enum):
@@ -28,6 +28,10 @@ class Window(Enum):
     HANN = auto()
     HAMM = auto()
     BLACKMAN = auto()
+
+class FFTTYPE(Enum):
+    FFT = auto()
+    IFFT = auto()
     
 class HyperParamAndSignal:
     def __init__(
@@ -116,6 +120,60 @@ class HyperParamAndSignal:
             return signal * blackman_window, blackman_window
         else:
             raise NotImplementedError("Not support window type")
+
+def local_fft_api(
+    n_sampe : int,
+    real : np.ndarray,
+    imag : Optional[np.ndarray] = None,
+    FT : FFTTYPE = FFTTYPE.FFT,
+    FIXP : int = 1024, # MCU has local fft core which only support 1024 point
+):
+    assert n_sampe % FIXP == 0, "not support this time"
+    if n_sampe <= FIXP:
+        if FT == FFTTYPE.FFT:
+            if imag is None:
+                return npfft(real, n_sampe)
+            else:
+                return npfft(real + 1j * imag, n_sampe)
+        elif FT == FFTTYPE.IFFT:
+            if imag is None:
+                return npfft(real, n_sampe) / n_sampe
+            else:
+                return npfft(real - 1j * imag, n_sampe) / n_sampe
+        else:
+            raise NotImplementedError("not support fft type")
+
+    if imag is None:
+        imag = np.zeros(n_sampe)
+    if len(real) < n_sampe:
+        real = np.pad(real, (0, n_sampe - len(real)))
+    if len(imag) < n_sampe:
+        imag = np.pad(imag, (0, n_sampe - len(imag)))
+    M = n_sampe // FIXP
+                   
+    if FT == FFTTYPE.FFT:
+        x = real + 1j * imag
+        amp_factor = 1.0
+    elif FT == FFTTYPE.IFFT:
+        x = real - 1j * imag
+        amp_factor = n_sampe
+    else:
+        raise NotImplementedError("not support fft type")
+    
+    # col reshape
+    x_2d = x.reshape(M, FIXP, order='F')
+    stage1 = np.zeros((M, FIXP), dtype=complex)
+    for i in range(M):
+        stage1[i, :] = npfft(x_2d[i, :], FIXP)
+    
+    twiddle = np.exp(-2j * np.pi * np.outer(np.arange(M), np.arange(FIXP)) / n_sampe)
+    stage2 = stage1 * twiddle
+    
+    X_2d = np.zeros((M, FIXP), dtype=complex)
+    for j in range(FIXP):
+        X_2d[:, j] = npfft(stage2[:, j], M)
+    
+    return X_2d.flatten() / amp_factor
 
 def find_local_maxima_manual(
     n_sampe : int,
@@ -214,8 +272,8 @@ def freq_estimate(
     else:
         raise NotImplementedError("Candan est not support window type")
     
-    fft_left_n = fft(osignal[: n_sampe - shifft_m] * window_val, n_sampe)
-    fft_right_n = fft(osignal[shifft_m : n_sampe] * window_val, n_sampe)
+    fft_left_n = local_fft_api(n_sampe, osignal[: n_sampe - shifft_m] * window_val)
+    fft_right_n = local_fft_api(n_sampe, osignal[shifft_m : n_sampe] * window_val)
     ph1, ph2 = np.angle(fft_left_n[pos]), np.angle(fft_right_n[pos])
     dph = ph2 - ph1
     dph_unk = dph - ((2 * np.pi * pos * shifft_m / n_sampe) % (2 * np.pi))
@@ -233,7 +291,7 @@ def freq_estimate(
         raise NotImplementedError("Candan est not support window type")
 
     amp_val = np.sqrt(fft_real[pos]**2 + fft_imag[pos]**2) * (2.0 / n_sampe) / np.abs(amp_factor)
-    print(f"pos={pos}, delta={delta}, amp_val={amp_val}")
+    # print(f"pos={pos}, delta={delta}, amp_val={amp_val}")
     candan_detect_freq = (pos + delta) * (float(fs) / n_sampe)
     
     return direct_detect_freq, candan_detect_freq, amp_val
@@ -309,19 +367,19 @@ def calc_decay_ratio(
 # ============================================================================
 if __name__ == "__main__":
 
-    FS = 4096 * 8
+    FS = 44100
     NS = 4096
     # orign_freq = [580, 850, 1016.660156, 2000.1275, 3468.976, 4765.1679, 5832.4198]
-    orign_freq = [1036.002]
+    orign_freq = [1036.035214]
     orign_freq_amp = 4.5
     signal_decay_rate = 3
     noise_freq = 50
     noise_freq_amp = 0.1
-    wnl = 0.000001
-    win_type = Window.HANN
+    wnl = 0.01
+    win_type = Window.RECT
     V_REF = 5
     ADC_BITS = 12
-    TRUC = 1
+    TRUC = 16
     
     # picture four
     fig, axes = plt.subplots(2, 3, figsize=(10, 8))
@@ -333,7 +391,7 @@ if __name__ == "__main__":
         signal, window_val = hps.apply_window(osignal_quant, win_type)
 
         # fft 
-        fft_res = fft(signal, NS)
+        fft_res = local_fft_api(hps.N(), signal)
         fft_real = fft_res.real
         fft_imag = fft_res.imag
         fft_magnitude = np.sqrt(fft_real**2 + fft_imag**2) * (2.0 / hps.N())
@@ -341,7 +399,7 @@ if __name__ == "__main__":
         # hilbert change for envelope
         hilbert_real, hilbert_imag = freq_hilbert_filter(hps.N(), fft_real, fft_imag)
         hilbert_complex_signal = hilbert_real + 1j * hilbert_imag
-        hilbert_res = ifft(hilbert_complex_signal)
+        hilbert_res = local_fft_api(hps.N(), hilbert_real, hilbert_imag, FFTTYPE.IFFT)
         signal_envelope = np.abs(hilbert_res / np.abs(window_val))
         
         # calc for decay_ratio
