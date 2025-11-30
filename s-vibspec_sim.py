@@ -1,3 +1,17 @@
+######################################################################################
+# Description: Vibrating Wire Measurement Algorithm Simulation
+
+# Author: Yuechao Guo
+# Copyright (c) 2024 Yuechao Guo. All Rights Reserved.
+# This code is protected by copyright law and intellectual property rights.
+# No part of this code may be reproduced, distributed, modified, or used in any form
+# without the explicit written permission of the author, Yuechao Guo.
+
+# Contact: [wesolost@163.com]
+# Created: [2025-11-18]
+# Last Modified: [2025-11-128]
+# Version: [v1]
+#####################################################################################
 import sys
 import numpy as np
 import matplotlib.pyplot as plt
@@ -106,23 +120,49 @@ class HyperParamAndSignal:
 def find_local_maxima_manual(
     n_sampe : int,
     fft_vec : np.ndarray,
+    win_type : Window = Window.RECT,
     th_val : float = 0.0,
 ):
     maxima = []
-    index = []
+    peaks = []
     for i in range(1, n_sampe // 2 - 1):
         if fft_vec[i] > fft_vec[i-1] and fft_vec[i] >= fft_vec[i+1] and fft_vec[i] > th_val:
-            index.append(i)
+            peaks.append(i)
             maxima.append(fft_vec[i])
     
-    indices = np.argpartition(maxima, -2)[-2:]
-    return np.array([index[i] for i in indices])
-    # peaks, properties = find_peaks(fft_vec, height=th_val, distance=len(fft_vec) // 100, prominence=np.std(fft_vec))
-    # if len(peaks) >= 2:
-    #     indices = np.argpartition(peaks, -2)[-2:]
-    # else:
-    #     indices = peaks
-    # return np.array([i for i in indices])    
+    sorted_indices = np.argsort(peaks)
+    sorted_peaks = np.array(peaks)[sorted_indices]
+    sorted_values = np.array(maxima)[sorted_indices]
+    
+    merged_peaks = []
+    merged_values = []
+    current_cluster = [sorted_peaks[0]]
+    current_values = [sorted_values[0]]
+    max_distance = 8
+    
+    for i in range(1, len(sorted_peaks)):
+        if sorted_peaks[i] - current_cluster[-1] <= max_distance:
+            current_cluster.append(sorted_peaks[i])
+            current_values.append(sorted_values[i])
+        else:
+            max_idx = np.argmax(current_values)
+            merged_peaks.append(current_cluster[max_idx])
+            merged_values.append(current_values[max_idx])
+            
+            current_cluster = [sorted_peaks[i]]
+            current_values = [sorted_values[i]]
+    
+    if current_cluster:
+        max_idx = np.argmax(current_values)
+        merged_peaks.append(current_cluster[max_idx])
+        merged_values.append(current_values[max_idx])
+    
+    # print(f"{merged_peaks}, {merged_values}")
+    if len(merged_peaks) > 2:
+        top_two_indices = np.argsort(merged_values)[-2:][::-1]
+        top_two_merged_peaks = [merged_peaks[i] for i in top_two_indices]
+        return top_two_merged_peaks
+    return merged_peaks
 
 def candan_delta_est(
     n_sampe : int,
@@ -143,7 +183,6 @@ def freq_estimate(
     fft_real : np.ndarray,
     fft_imag : np.ndarray,
     osignal : np.ndarray,
-    fft_magnitude : np.ndarray,
     win_type : Window = Window.RECT,
 ):  
     pos = max(1, pos)
@@ -163,72 +202,31 @@ def freq_estimate(
         candan_detect_freq = (pos + delta) * (float(fs) / n_sampe)
         return direct_detect_freq, candan_detect_freq, amp_val
     
-    window_val = np.ones(n_sampe // 2)
+    # phase diff method
+    shifft_m = n_sampe // 4 # less than n_sampe // 2
+    window_val = np.ones(n_sampe - shifft_m)
     if win_type == Window.HANN:
-        window_val = np.hanning(n_sampe // 2)
+        window_val = np.hanning(n_sampe - shifft_m)
     elif win_type == Window.HAMM:
-        window_val = np.hanning(n_sampe // 2)
+        window_val = np.hamming(n_sampe - shifft_m)
     elif win_type == Window.BLACKMAN:
-        window_val = np.hanning(n_sampe // 2)
+        window_val = np.blackman(n_sampe - shifft_m)
     else:
         raise NotImplementedError("Candan est not support window type")
     
-    # phase diff method
-    fft_left_half = fft(osignal[: n_sampe // 2 ] * window_val, n_sampe)
-    fft_right_half = fft(osignal[n_sampe // 2 :] * window_val, n_sampe)
-    ph1, ph2 = np.angle(fft_left_half[pos]), np.angle(fft_right_half[pos])
+    fft_left_n = fft(osignal[: n_sampe - shifft_m] * window_val, n_sampe)
+    fft_right_n = fft(osignal[shifft_m : n_sampe] * window_val, n_sampe)
+    ph1, ph2 = np.angle(fft_left_n[pos]), np.angle(fft_right_n[pos])
     dph = ph2 - ph1
-    dph = dph - 2 * np.pi * np.round(dph / (2 * np.pi))
-    delta = dph / np.pi
-    
-    # only use candan estimate for usage of reference phase sign
-    dlpra = candan_delta_est(n_sampe, pos, fft_real, fft_imag)
-   
-    if delta >= 0.5:
-        delta -= 1
-    elif delta < -0.5:
-        delta += 1
-         
-    if dlpra > 0:
-        if delta < 0:
-            delta += 1.0     
-    else:
-        if delta > 0:
-            delta -= 1
+    dph_unk = dph - ((2 * np.pi * pos * shifft_m / n_sampe) % (2 * np.pi))
+    delta = dph_unk * n_sampe / (2 * np.pi * shifft_m)
     
     amp_factor = 1.0
     if win_type == Window.HANN:
-        # th_factor = 0.5 * np.sinc(delta) + 0.25 * np.sinc(delta - 1) + 0.25 * np.sinc(delta + 1)
-        # th_factor_sign = 0.5 * np.sinc(delta - np.sign(delta)) + 0.25 * np.sinc(delta - np.sign(delta) - 1) + 0.25 * np.sinc(delta - np.sign(delta) + 1)
-        
-        # if np.abs(th_factor_sign) > np.abs(th_factor):
-        #     delta = delta - np.sign(delta)
-        #     amp_factor = th_factor_sign
-        # else:
-        #     amp_factor = th_factor
         amp_factor = 0.5 * np.sinc(delta) + 0.25 * np.sinc(delta - 1) + 0.25 * np.sinc(delta + 1)
     elif win_type == Window.HAMM:
-        # th_factor = 0.54 * np.sinc(delta) + 0.23 * np.sinc(delta - 1) + 0.23 * np.sinc(delta + 1)
-        # th_factor_sign = 0.54 * np.sinc(delta - np.sign(delta)) + 0.23 * np.sinc(delta - np.sign(delta) - 1) + 0.23 * np.sinc(delta - np.sign(delta) + 1)
-        
-        # if np.abs(th_factor_sign) > np.abs(th_factor):
-        #     delta = delta - np.sign(delta)
-        #     amp_factor = th_factor_sign
-        # else:
-        #     amp_factor = th_factor
         amp_factor = 0.54 * np.sinc(delta) + 0.23 * np.sinc(delta - 1) + 0.23 * np.sinc(delta + 1)
     elif win_type == Window.BLACKMAN:
-        # th_factor = 0.42 * np.sinc(delta) - 0.25 * np.sinc(delta - 1) - 0.25 * np.sinc(delta - 1) \
-        #     + 0.04 * np.sinc(delta - 2) + 0.04 * np.sinc(delta + 2)   
-        # s_delta = delta - np.sign(delta)
-        # th_factor_sign = 0.42 * np.sinc(s_delta) - 0.25 * np.sinc(s_delta - 1) - 0.25 * np.sinc(s_delta - 1) \
-        #     + 0.04 * np.sinc(s_delta - 2) + 0.04 * np.sinc(s_delta + 2)
-
-        # if np.abs(th_factor_sign) > np.abs(th_factor):
-        #     delta = delta - np.sign(delta)
-        #     amp_factor = th_factor_sign
-        # else:
-        #     amp_factor = th_factor
         amp_factor = 0.42 * np.sinc(delta) - 0.25 * np.sinc(delta - 1) - 0.25 * np.sinc(delta - 1) \
             + 0.04 * np.sinc(delta - 2) + 0.04 * np.sinc(delta + 2)
     else:
@@ -314,7 +312,7 @@ if __name__ == "__main__":
     FS = 4096 * 8
     NS = 4096
     # orign_freq = [580, 850, 1016.660156, 2000.1275, 3468.976, 4765.1679, 5832.4198]
-    orign_freq = [1027.98432]
+    orign_freq = [1036.002]
     orign_freq_amp = 4.5
     signal_decay_rate = 3
     noise_freq = 50
@@ -322,7 +320,7 @@ if __name__ == "__main__":
     wnl = 0.000001
     win_type = Window.HANN
     V_REF = 5
-    ADC_BITS = 24
+    ADC_BITS = 12
     TRUC = 1
     
     # picture four
@@ -330,9 +328,9 @@ if __name__ == "__main__":
     hps = HyperParamAndSignal(freq_sample=FS, n_sample=NS, decay_rate=signal_decay_rate, white_noise_level=wnl)
     for fq in orign_freq:
         # generate signal and window
-        osignal = hps.generate_signal(A0=orign_freq_amp, freq=fq, nA0=noise_freq_amp, nfreq=noise_freq)
-        signal_analog, window_val = hps.apply_window(osignal, win_type)
-        signal, s_d = hps.adc_quantize(signal_analog, V_REF, ADC_BITS)
+        signal_analog = hps.generate_signal(A0=orign_freq_amp, freq=fq, nA0=noise_freq_amp, nfreq=noise_freq)
+        osignal_quant, s_d = hps.adc_quantize(signal_analog, V_REF, ADC_BITS)
+        signal, window_val = hps.apply_window(osignal_quant, win_type)
 
         # fft 
         fft_res = fft(signal, NS)
@@ -353,12 +351,12 @@ if __name__ == "__main__":
         print(f"decay_ratio={decay_ratio:4.6f}")
         
         # find local max and candan detection for every peak
-        vec_pos = find_local_maxima_manual(hps.N(), fft_magnitude, th_val=0.01)
+        vec_pos = find_local_maxima_manual(hps.N(), fft_magnitude, th_val=0.001)
         detect_result = []
         for pos in vec_pos:
             if pos == 0 or pos == hps.N() / 2:
                 continue
-            direct_detect_freq, candan_detect_freq, amp_val = freq_estimate(hps.FS(), hps.N(), pos, fft_real, fft_imag, osignal, fft_magnitude, win_type)
+            direct_detect_freq, candan_detect_freq, amp_val = freq_estimate(hps.FS(), hps.N(), pos, fft_real, fft_imag, osignal_quant, win_type)
             one_peak = {"pos": pos, "val":amp_val, \
                         "direct_detect_freq":direct_detect_freq, "candan_detect_freq":candan_detect_freq}
             detect_result.append(one_peak)
@@ -378,7 +376,7 @@ if __name__ == "__main__":
         print(f"sensor_to_noise_ratio={sensor_to_noise_ratio:4.6f}dB")
     
     # sys.exit(1)
-    axes[0, 0].plot(signal_analog, 'b-', linewidth=2)
+    axes[0, 0].plot(signal, 'b-', linewidth=2)
     axes[0, 0].set_title('Signal')
     axes[0, 0].set_ylabel('AMP')
     axes[0, 0].grid(True)
