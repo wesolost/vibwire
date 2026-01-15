@@ -78,7 +78,7 @@ if __name__ == "__main__":
     
     swap_freq_begin = 1000
     swap_freq_end = 4000
-    swap_steps = 8
+    swap_steps = 50
     swap_step_duation = 1  # 1 ms for every swap freq point
     
     hps = HyperParamAndSignalTable(freq_sample=FS, n_sample=NS)

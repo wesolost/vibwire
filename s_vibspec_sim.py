@@ -167,6 +167,7 @@ def local_fft_api(
         stage1[i, :] = npfft(x_2d[i, :], FIXP)
     
     twiddle = np.exp(-2j * np.pi * np.outer(np.arange(M), np.arange(FIXP)) / n_sampe)
+    # print(f"twiddle={twiddle}")
     stage2 = stage1 * twiddle
     
     X_2d = np.zeros((M, FIXP), dtype=complex)
@@ -277,6 +278,7 @@ def freq_estimate(
     ph1, ph2 = np.angle(fft_left_n[pos]), np.angle(fft_right_n[pos])
     dph = ph2 - ph1
     dph_unk = dph - ((2 * np.pi * pos * shifft_m / n_sampe) % (2 * np.pi))
+    dph_unk = dph_unk - 2 * np.pi * np.floor((dph_unk + np.pi) / (2 * np.pi))
     delta = dph_unk * n_sampe / (2 * np.pi * shifft_m)
     
     amp_factor = 1.0
@@ -365,99 +367,223 @@ def calc_decay_ratio(
 # ============================================================================
 # algo sim show
 # ============================================================================
-if __name__ == "__main__":
 
-    FS = 44100
+def run_sim(
+    hps : HyperParamAndSignal,
+    sensor_freq : float,
+    orign_freq_amp :float,
+    noise_freq : float,
+    noise_freq_amp : float,
+    win_type : Window,
+    V_REF : int,
+    ADC_BITS : int,
+    TRUC : int,
+):
+    # generate signal and window
+    signal_analog = hps.generate_signal(A0=orign_freq_amp, freq=sensor_freq, nA0=noise_freq_amp, nfreq=noise_freq)
+    osignal_quant, s_d = hps.adc_quantize(signal_analog, V_REF, ADC_BITS)
+    signal, window_val = hps.apply_window(osignal_quant, win_type)
+
+    # fft 
+    fft_res = local_fft_api(hps.N(), signal)
+    fft_real = fft_res.real
+    fft_imag = fft_res.imag
+    fft_magnitude = np.sqrt(fft_real**2 + fft_imag**2) * (2.0 / hps.N())
+
+    # hilbert change for envelope
+    hilbert_real, hilbert_imag = freq_hilbert_filter(hps.N(), fft_real, fft_imag)
+    # hilbert_complex_signal = hilbert_real + 1j * hilbert_imag
+    hilbert_res = local_fft_api(hps.N(), hilbert_real, hilbert_imag, FFTTYPE.IFFT)
+    signal_envelope = np.abs(hilbert_res / np.abs(window_val))
+    
+    # calc for decay_ratio
+    ln_result = np.log(signal_envelope)
+    tp = np.linspace(0, hps.DT(), hps.N(), endpoint=False)
+    decay_ratio = calc_decay_ratio(hps.N() - 2 * TRUC, ln_result[TRUC:-TRUC], tp[TRUC:-TRUC]) * (-1.0)
+    # print(f"decay_ratio={decay_ratio:4.6f}")
+    
+    # find local max and candan detection for every peak
+    vec_pos = find_local_maxima_manual(hps.N(), fft_magnitude, th_val=0.001)
+    detect_result = []
+    for pos in vec_pos:
+        if pos == 0 or pos == hps.N() / 2:
+            continue
+        direct_detect_freq, candan_detect_freq, amp_val = freq_estimate(hps.FS(), hps.N(), pos, fft_real, fft_imag, osignal_quant, win_type)
+        one_peak = {"pos": pos, "val":amp_val, \
+                    "direct_detect_freq":direct_detect_freq, "candan_detect_freq":candan_detect_freq}
+        detect_result.append(one_peak)
+    
+    # get metric
+    sensor_freq, sensor_amplitude, noise_freq, noise_amplitude, sensor_to_noise_ratio = sensor_noise_freq_metric(detect_result)
+        
+    # correct the amp
+    drsample = np.abs(np.exp(-decay_ratio * tp))
+    sensor_amplitude = np.sum(sensor_amplitude / drsample) / hps.N()
+    noise_amplitude = np.sum(noise_amplitude / drsample) / hps.N()
+    
+    return sensor_freq, sensor_amplitude, noise_freq, noise_amplitude, sensor_to_noise_ratio, decay_ratio, signal, window_val, s_d, fft_magnitude, signal_envelope
+
+
+from dataclasses import dataclass
+import numpy as np
+
+@dataclass
+class VibwireResult:
+    FS: int
+    NS: int
+    signal_decay_rate: float
+    wnl: float
+    low_bound: float
+    high_bound: float
+    orign_freq: float
+    orign_freq_amp: float
+    noise_freq: float
+    noise_freq_amp: float
+    win_type: Window
+    V_REF: int
+    ADC_BITS: int
+    TRUC: int
+    
+    sensor_freq: float
+    sensor_amplitude: float
+    est_noise_freq: float
+    est_noise_amplitude: float
+    sensor_to_noise_ratio: float
+    decay_ratio: float
+    signal: np.ndarray
+    window_val: np.ndarray
+    s_d: np.ndarray
+    fft_magnitude: np.ndarray
+    signal_envelope: np.ndarray
+
+def serial_get_result(
+    orign_freq: float
+):
+    FS = 45500
     NS = 4096
-    # orign_freq = [580, 850, 1016.660156, 2000.1275, 3468.976, 4765.1679, 5832.4198]
-    orign_freq = [1036.035214]
-    orign_freq_amp = 4.5
-    signal_decay_rate = 3
+    signal_decay_rate = 10
+    wnl = 0.1
+     
+    low_bound = 2000
+    high_bound = 6500
+    orign_freq = orign_freq
+    orign_freq_amp = 2.5
     noise_freq = 50
-    noise_freq_amp = 0.1
-    wnl = 0.01
+    noise_freq_amp = 0.5
+
     win_type = Window.RECT
     V_REF = 5
     ADC_BITS = 12
     TRUC = 16
-    
-    # picture four
-    fig, axes = plt.subplots(2, 3, figsize=(10, 8))
     hps = HyperParamAndSignal(freq_sample=FS, n_sample=NS, decay_rate=signal_decay_rate, white_noise_level=wnl)
+    sensor_freq, sensor_amplitude, est_noise_freq, est_noise_amplitude, sensor_to_noise_ratio, decay_ratio, signal, window_val, s_d, fft_magnitude, signal_envelope \
+        = run_sim(hps=hps, sensor_freq=orign_freq, orign_freq_amp=orign_freq_amp, noise_freq=noise_freq, noise_freq_amp=noise_freq_amp, win_type=win_type, V_REF=V_REF, ADC_BITS=ADC_BITS, TRUC=TRUC)
+    
+    print(f"sensor_freq={sensor_freq:4.6f}Hz")
+    print(f"sensor_amplitude={sensor_amplitude:4.6f}")
+    print(f"est_noise_freq={est_noise_freq:4.6f}Hz")
+    print(f"est_noise_amplitude={est_noise_amplitude:4.6f}")
+    print(f"sensor_to_noise_ratio={sensor_to_noise_ratio:4.6f}dB")
+    print(f"decay_ratio={decay_ratio:4.6f}dB")
+        
+    return VibwireResult(
+        FS=FS,
+        NS=NS,
+        signal_decay_rate=signal_decay_rate,
+        wnl=wnl,
+        low_bound=low_bound,
+        high_bound=high_bound,
+        orign_freq=orign_freq,
+        orign_freq_amp=orign_freq_amp,
+        noise_freq=noise_freq,
+        noise_freq_amp=noise_freq_amp,
+        win_type=win_type,
+        V_REF=V_REF,
+        ADC_BITS=ADC_BITS,
+        TRUC=TRUC,
+        sensor_freq=sensor_freq,
+        sensor_amplitude=sensor_amplitude,
+        est_noise_freq=est_noise_freq,
+        est_noise_amplitude=est_noise_amplitude,
+        sensor_to_noise_ratio=sensor_to_noise_ratio,
+        decay_ratio=decay_ratio,
+        signal=signal,
+        window_val=window_val,
+        s_d=s_d,
+        fft_magnitude=fft_magnitude,
+        signal_envelope=signal_envelope,
+    )
+
+if __name__ == "__main__":
+
+    FS = 45500
+    NS = 4096
+    signal_decay_rate = 10
+    wnl = 0.000001
+     
+    low_bound = 2000
+    high_bound = 6500
+    # random_numbers = np.random.uniform(low=low_bound, high=high_bound, size=200)
+    # orign_freq = np.sort(np.around(random_numbers, decimals=6))   
+    # orign_freq = [580, 850, 1016.660156, 2000.1275, 3468.976, 4765.1679, 5832.4198]
+    orign_freq = [994.76794]
+    orign_freq_amp = 2.5
+    noise_freq = 50
+    noise_freq_amp = 0.0000005
+
+    win_type = Window.RECT
+    V_REF = 5
+    ADC_BITS = 32
+    TRUC = 16
+    
+    hps = HyperParamAndSignal(freq_sample=FS, n_sample=NS, decay_rate=signal_decay_rate, white_noise_level=wnl)
+    output_freqs = []
     for fq in orign_freq:
-        # generate signal and window
-        signal_analog = hps.generate_signal(A0=orign_freq_amp, freq=fq, nA0=noise_freq_amp, nfreq=noise_freq)
-        osignal_quant, s_d = hps.adc_quantize(signal_analog, V_REF, ADC_BITS)
-        signal, window_val = hps.apply_window(osignal_quant, win_type)
-
-        # fft 
-        fft_res = local_fft_api(hps.N(), signal)
-        fft_real = fft_res.real
-        fft_imag = fft_res.imag
-        fft_magnitude = np.sqrt(fft_real**2 + fft_imag**2) * (2.0 / hps.N())
-
-        # hilbert change for envelope
-        hilbert_real, hilbert_imag = freq_hilbert_filter(hps.N(), fft_real, fft_imag)
-        hilbert_complex_signal = hilbert_real + 1j * hilbert_imag
-        hilbert_res = local_fft_api(hps.N(), hilbert_real, hilbert_imag, FFTTYPE.IFFT)
-        signal_envelope = np.abs(hilbert_res / np.abs(window_val))
-        
-        # calc for decay_ratio
-        ln_result = np.log(signal_envelope)
-        tp = np.linspace(0, hps.DT(), hps.N(), endpoint=False)
-        decay_ratio = calc_decay_ratio(hps.N() - 2 * TRUC, ln_result[TRUC:-TRUC], tp[TRUC:-TRUC]) * (-1.0)
-        print(f"decay_ratio={decay_ratio:4.6f}")
-        
-        # find local max and candan detection for every peak
-        vec_pos = find_local_maxima_manual(hps.N(), fft_magnitude, th_val=0.001)
-        detect_result = []
-        for pos in vec_pos:
-            if pos == 0 or pos == hps.N() / 2:
-                continue
-            direct_detect_freq, candan_detect_freq, amp_val = freq_estimate(hps.FS(), hps.N(), pos, fft_real, fft_imag, osignal_quant, win_type)
-            one_peak = {"pos": pos, "val":amp_val, \
-                        "direct_detect_freq":direct_detect_freq, "candan_detect_freq":candan_detect_freq}
-            detect_result.append(one_peak)
-        
-        # get metric
-        sensor_freq, sensor_amplitude, noise_freq, noise_amplitude, sensor_to_noise_ratio = sensor_noise_freq_metric(detect_result)
-        
-        # correct the amp
-        drsample = np.abs(np.exp(-decay_ratio * tp))
-        sensor_amplitude = np.sum(sensor_amplitude / drsample) / hps.N()
-        noise_amplitude = np.sum(noise_amplitude / drsample) / hps.N()
+        sensor_freq, sensor_amplitude, noise_freq, noise_amplitude, sensor_to_noise_ratio, decay_ratio, signal, window_val, s_d, fft_magnitude, signal_envelope \
+            = run_sim(hps=hps, sensor_freq=fq, orign_freq_amp=orign_freq_amp, noise_freq=noise_freq, noise_freq_amp=noise_freq_amp, win_type=win_type, V_REF=V_REF, ADC_BITS=ADC_BITS, TRUC=TRUC)
         
         print(f"sensor_freq={sensor_freq:4.6f}Hz")
         print(f"sensor_amplitude={sensor_amplitude:4.6f}")
         print(f"noise_freq={noise_freq:4.6f}Hz")
         print(f"noise_amplitude={noise_amplitude:4.6f}")
         print(f"sensor_to_noise_ratio={sensor_to_noise_ratio:4.6f}dB")
-    
-    # sys.exit(1)
-    axes[0, 0].plot(signal, 'b-', linewidth=2)
-    axes[0, 0].set_title('Signal')
-    axes[0, 0].set_ylabel('AMP')
-    axes[0, 0].grid(True)
-    
-    axes[0, 1].plot(window_val, 'r-', linewidth=2)
-    axes[0, 1].set_title('Window')
-    axes[0, 1].set_ylabel('AMP')
-    axes[0, 1].grid(True)
-    
-    axes[0, 2].plot(s_d, 'b-', linewidth=2)
-    axes[0, 2].set_title('Signal-ADC-Quantize')
-    axes[0, 2].set_ylabel('AMP')
-    axes[0, 2].grid(True)
+        print(f"decay_ratio={decay_ratio:4.6f}dB")
+        
+        output_freqs.append(np.around(sensor_freq, decimals=6))
+        # sys.exit(1)
+        fig, axes = plt.subplots(2, 3, figsize=(10, 8))
+        axes[0, 0].plot(signal, 'b-', linewidth=2)
+        axes[0, 0].set_title('Signal')
+        axes[0, 0].set_ylabel('AMP')
+        axes[0, 0].grid(True)
+        
+        axes[0, 1].plot(window_val, 'r-', linewidth=2)
+        axes[0, 1].set_title('Window')
+        axes[0, 1].set_ylabel('AMP')
+        axes[0, 1].grid(True)
+        
+        axes[0, 2].plot(s_d, 'b-', linewidth=2)
+        axes[0, 2].set_title('Signal-ADC-Quantize')
+        axes[0, 2].set_ylabel('AMP')
+        axes[0, 2].grid(True)
 
-    axes[1, 0].semilogy(fft_magnitude, linewidth=2)
-    # axes[1, 0].plot(fft_magnitude, linewidth=2)
-    axes[1, 0].set_title('Spectral')
-    axes[1, 0].set_ylabel('AMP')
-    axes[1, 0].grid(True)
-    
-    axes[1, 1].plot(signal_envelope, linewidth=2)
-    axes[1, 1].set_title('Envelope')
-    axes[1, 1].set_ylabel('AMP')
-    axes[1, 1].grid(True)
-    plt.tight_layout()
-    plt.show()
+        axes[1, 0].semilogy(fft_magnitude, linewidth=2)
+        # axes[1, 0].plot(fft_magnitude, linewidth=2)
+        axes[1, 0].set_title('Spectral')
+        axes[1, 0].set_ylabel('AMP')
+        axes[1, 0].grid(True)
+        
+        axes[1, 1].plot(signal_envelope, linewidth=2)
+        axes[1, 1].set_title('Envelope')
+        axes[1, 1].set_ylabel('AMP')
+        axes[1, 1].grid(True)
+        plt.tight_layout()
+        plt.show()
+    # plt.figure()
+    # plt.plot(orign_freq, orign_freq - output_freqs, 'r-', linewidth=2)
+    # plt.xlabel('Frequency')
+    # plt.ylabel('Frequency Estimation Error / Hz')
+    # plt.grid(True)
+    # plt.tight_layout()
+    # plt.show()
+    s = serial_get_result(orign_freq=992.1237)
