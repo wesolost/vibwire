@@ -28,7 +28,7 @@ log.setLevel(logging.INFO)
 class SerialModbusServer:
     def __init__(self):
         self.port = 'COM11'
-        self.baudrate = 961200
+        self.baudrate = 115200
         self.bytesize = serial.EIGHTBITS
         self.parity = serial.PARITY_NONE
         self.stopbits = serial.STOPBITS_ONE
@@ -140,10 +140,11 @@ class SerialModbusServer:
             
             print(f"Executing one-time sampling on channel {channel}...")
             # 生成200到6500之间的随机浮点数作为orign_freq
+            start_time = time.time()
             orign_freq = random.uniform(200, 6500)
-            print(f"Generated random origin frequency: {orign_freq:.4f} Hz")
             vibwire_result = serial_get_result(orign_freq=orign_freq)
             vibwire_queue.append(vibwire_result)
+            execution_time = time.time() - start_time
             
             # 从vibwire_queue获取数据，如果队列不为空
             if len(vibwire_queue) > 0:
@@ -162,7 +163,7 @@ class SerialModbusServer:
                 temperature = 20.0 + channel * 1.5  # 保留模拟温度
                 voltage_excitation_amplitude = 5.0  # 使用原始频率幅度转换
                 system_sample_rate = vibwire_res.FS  # 使用实际采样频率
-                one_process_time = 0.5  # 根据采样点数和采样频率计算处理时间
+                one_process_time = execution_time*1000  # 根据采样点数和采样频率计算处理时间
                 
                 print(f"Using data from queue for channel {channel}:")
                 print(f"  Signal Frequency: {signal_frequency:.2f} Hz")

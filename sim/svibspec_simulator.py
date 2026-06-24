@@ -9,7 +9,7 @@
 
 # Contact: [wesolost@163.com]
 # Created: [2025-11-18]
-# Last Modified: [2025-11-128]
+# Last Modified: [2025-11-28]
 # Version: [v1]
 #####################################################################################
 import sys
@@ -355,6 +355,58 @@ def freq_hilbert_filter(
     
     return fft_real * hilbert_arr, fft_imag * hilbert_arr
 
+def freq_hilbert_envelope(
+    signal : np.ndarray,
+    n_sampe : int,
+    edge_pad : int | None = None,
+) -> np.ndarray:
+    if edge_pad is None:
+        edge_pad = n_sampe
+    if edge_pad <= 0:
+        padded_signal = signal
+        crop_start = 0
+    else:
+        padded_signal = np.pad(signal, (edge_pad, edge_pad), mode='reflect')
+        crop_start = edge_pad
+
+    padded_n = len(padded_signal)
+    fft_res = local_fft_api(padded_n, padded_signal)
+    hilbert_real, hilbert_imag = freq_hilbert_filter(padded_n, fft_res.real, fft_res.imag)
+    analytic_signal = local_fft_api(padded_n, hilbert_real, hilbert_imag, FFTTYPE.IFFT)
+    return np.abs(analytic_signal[crop_start : crop_start + n_sampe])
+
+def stabilize_envelope_edges(
+    envelope : np.ndarray,
+    edge_samples : int,
+    fit_samples : int | None = None,
+) -> np.ndarray:
+    stable_envelope = np.asarray(envelope, dtype=float).copy()
+    n_sampe = len(stable_envelope)
+    edge_samples = min(max(edge_samples, 0), n_sampe // 4)
+    if edge_samples <= 1:
+        return stable_envelope
+
+    if fit_samples is None:
+        fit_samples = max(2 * edge_samples, 16)
+    fit_samples = min(fit_samples, n_sampe - 2 * edge_samples)
+    if fit_samples <= 2:
+        return stable_envelope
+
+    sample_index = np.arange(n_sampe, dtype=float)
+    log_envelope = np.log(np.maximum(stable_envelope, 1.0e-12))
+
+    left_fit = slice(edge_samples, edge_samples + fit_samples)
+    left_slope, left_intercept = np.polyfit(sample_index[left_fit], log_envelope[left_fit], 1)
+    left_index = sample_index[:edge_samples]
+    stable_envelope[:edge_samples] = np.exp(left_slope * left_index + left_intercept)
+
+    right_fit = slice(n_sampe - edge_samples - fit_samples, n_sampe - edge_samples)
+    right_slope, right_intercept = np.polyfit(sample_index[right_fit], log_envelope[right_fit], 1)
+    right_index = sample_index[n_sampe - edge_samples:]
+    stable_envelope[n_sampe - edge_samples:] = np.exp(right_slope * right_index + right_intercept)
+
+    return stable_envelope
+
 def calc_decay_ratio(
     n_sampe : int,
     y : np.ndarray,
@@ -390,16 +442,25 @@ def run_sim(
     fft_imag = fft_res.imag
     fft_magnitude = np.sqrt(fft_real**2 + fft_imag**2) * (2.0 / hps.N())
 
-    # hilbert change for envelope
-    hilbert_real, hilbert_imag = freq_hilbert_filter(hps.N(), fft_real, fft_imag)
-    # hilbert_complex_signal = hilbert_real + 1j * hilbert_imag
-    hilbert_res = local_fft_api(hps.N(), hilbert_real, hilbert_imag, FFTTYPE.IFFT)
-    signal_envelope = np.abs(hilbert_res / np.abs(window_val))
+    # Hilbert envelope is calculated on the unwindowed signal with mirrored
+    # padding to reduce FFT periodic-extension artifacts at both edges.
+    edge_samples = min(
+        hps.N() // 4,
+        max(TRUC, int(round(8.0 * hps.FS() / max(sensor_freq, 1.0)))),
+    )
+    signal_envelope = stabilize_envelope_edges(
+        freq_hilbert_envelope(osignal_quant, hps.N()),
+        edge_samples=edge_samples,
+    )
     
     # calc for decay_ratio
     ln_result = np.log(signal_envelope)
     tp = np.linspace(0, hps.DT(), hps.N(), endpoint=False)
-    decay_ratio = calc_decay_ratio(hps.N() - 2 * TRUC, ln_result[TRUC:-TRUC], tp[TRUC:-TRUC]) * (-1.0)
+    decay_ratio = calc_decay_ratio(
+        hps.N() - 2 * edge_samples,
+        ln_result[edge_samples:-edge_samples],
+        tp[edge_samples:-edge_samples],
+    ) * (-1.0)
     # print(f"decay_ratio={decay_ratio:4.6f}")
     
     # find local max and candan detection for every peak
@@ -416,10 +477,11 @@ def run_sim(
     # get metric
     sensor_freq, sensor_amplitude, noise_freq, noise_amplitude, sensor_to_noise_ratio = sensor_noise_freq_metric(detect_result)
         
-    # correct the amp
+    # correct the amp: FFT amplitude corresponds to the window-weighted
+    # average of the exponentially decayed amplitude in the sample window.
     drsample = np.abs(np.exp(-decay_ratio * tp))
-    sensor_amplitude = np.sum(sensor_amplitude / drsample) / hps.N()
-    noise_amplitude = np.sum(noise_amplitude / drsample) / hps.N()
+    decay_factor = np.sum(np.abs(window_val) * drsample) / np.sum(np.abs(window_val))
+    sensor_amplitude = sensor_amplitude / max(decay_factor, 1.0e-12)
     
     return sensor_freq, sensor_amplitude, noise_freq, noise_amplitude, sensor_to_noise_ratio, decay_ratio, signal, window_val, s_d, fft_magnitude, signal_envelope
 
@@ -561,18 +623,18 @@ if __name__ == "__main__":
 
     FS = 65000
     NS = 16384
-    signal_decay_rate = 10
-    wnl = 0.0000001
+    signal_decay_rate = 8
+    wnl = 0.001
      
     # low_bound = 2000
     # high_bound = 6500
     # random_numbers = np.random.uniform(low=low_bound, high=high_bound, size=200)
     # orign_freq = np.sort(np.around(random_numbers, decimals=6))   
     # orign_freq = [580, 850, 1016.660156, 2000.1275, 3468.976, 4765.1679, 5832.4198]
-    orign_freq = [994.76794]
-    orign_freq_amp = 2.5
+    orign_freq = [2500]
+    orign_freq_amp = 1.5
     noise_freq = 50
-    noise_freq_amp = 0.000001
+    noise_freq_amp = 0.05
 
     win_type = Window.RECT
     V_REF = 5
